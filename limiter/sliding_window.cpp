@@ -14,6 +14,33 @@ std::chrono::system_clock::time_point truncateTo(std::chrono::system_clock::time
     return std::chrono::system_clock::time_point(count * unit);
 }
 
+const char* kSlidingWindowScript = R"(
+	local prevKey = KEYS[1]
+	local curKey = KEYS[2]
+	local limit = tonumber(ARGV[1])
+	local remainingRatio = tonumber(ARGV[2])
+	local window = tonumber(ARGV[3])
+
+	local result = redis.call("MGET", prevKey, curKey)
+	local prevCount = result[1]
+	local currCount = result[2]
+
+	if prevCount == false then prevCount = 0 else prevCount = tonumber(prevCount) end
+	if currCount == false then currCount = 0 else currCount = tonumber(currCount) end
+
+	local estimate = (prevCount * remainingRatio) + currCount
+	if estimate < limit then
+		local newCount = redis.call("INCR", curKey)
+		if newCount == 1 then
+			redis.call("EXPIRE", curKey, window)
+		end
+		local remaining = limit - estimate - 1
+		return {1, remaining}
+	else
+		return {0, 0}
+	end
+)";
+
 }  // namespace
 
 Result SlidingWindowLimiter::Allow(const std::string& key) {
@@ -28,51 +55,29 @@ Result SlidingWindowLimiter::Allow(const std::string& key) {
     std::string curKey = key + ":" + std::to_string(curUnix);
     std::string prevKey = key + ":" + std::to_string(prevUnix);
 
+    // Calculate what fraction of the previous sub-window still falls inside the
+    // current sliding window. Capped at 1.0 for when it's fully within range.
+    auto swStart = now - window_;
+    double remainingRatio =
+        std::min(1.0, std::chrono::duration<double>((curSW + sub_window_) - swStart).count() /
+                           std::chrono::duration<double>(sub_window_).count());
+
+    // Pass remainingRatio from C++ rather than calculating it in Lua — time math
+    // is simpler here and keeps the script focused on Redis operations.
     redisReply* reply = static_cast<redisReply*>(
-        redisCommand(client_, "MGET %s %s", prevKey.c_str(), curKey.c_str()));
+        redisCommand(client_, "EVAL %s 2 %s %s %d %f %lld", kSlidingWindowScript,
+                     prevKey.c_str(), curKey.c_str(), limit_, remainingRatio,
+                     (long long)window_.count()));
     if (reply == nullptr || reply->type != REDIS_REPLY_ARRAY || reply->elements != 2) {
         if (reply) freeReplyObject(reply);
-        throw std::runtime_error("error: could not retrieve values of specified keys");
+        throw std::runtime_error("error: sliding window script failed");
     }
 
-    auto prevEnd = prevSW + sub_window_;
-    auto swStart = now - window_;
-    auto swSize = sub_window_;
-
-    double remainingRatio =
-        std::min(1.0, std::chrono::duration<double>(prevEnd - swStart).count() /
-                           std::chrono::duration<double>(swSize).count());
-
-    double prevCount = 0;
-    if (reply->element[0]->type == REDIS_REPLY_STRING) {
-        prevCount = std::stod(reply->element[0]->str);
-    }
-    double currCount = 0;
-    if (reply->element[1]->type == REDIS_REPLY_STRING) {
-        currCount = std::stod(reply->element[1]->str);
-    }
+    long long allowed = reply->element[0]->integer;
+    long long remaining = reply->element[1]->integer;
     freeReplyObject(reply);
 
-    double estimate = (prevCount * remainingRatio) + currCount;
-
-    if (estimate < limit_) {
-        redisReply* incrReply =
-            static_cast<redisReply*>(redisCommand(client_, "INCR %s", curKey.c_str()));
-        if (incrReply == nullptr) {
-            throw std::runtime_error("error: could not increment current sub window counter");
-        }
-        long long newCount = incrReply->integer;
-        freeReplyObject(incrReply);
-
-        if (newCount == 1) {
-            redisReply* expireReply = static_cast<redisReply*>(redisCommand(
-                client_, "EXPIRE %s %lld", curKey.c_str(), (long long)window_.count()));
-            if (expireReply) freeReplyObject(expireReply);
-        }
-
-        return Result{true, limit_ - static_cast<int>(estimate) - 1, now + window_};
-    }
-    return Result{false, 0, now + window_};
+    return Result{allowed == 1, static_cast<int>(remaining), now + window_};
 }
 
 }  // namespace limiter
