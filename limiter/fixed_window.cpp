@@ -31,7 +31,7 @@ Result FixedWindowLimiter::Allow(const std::string& key) {
     redisReply* reply =
         static_cast<redisReply*>(redisCommand(client_, "INCR %s", windowKey.c_str()));
     if (reply == nullptr) {
-        throw std::runtime_error("error: could not increment redis counter");
+        return fallback_->Allow(key);
     }
     long long count = reply->integer;
     freeReplyObject(reply);
@@ -41,7 +41,7 @@ Result FixedWindowLimiter::Allow(const std::string& key) {
         redisReply* expireReply = static_cast<redisReply*>(
             redisCommand(client_, "EXPIRE %s %lld", windowKey.c_str(), (long long)window_.count()));
         if (expireReply == nullptr) {
-            throw std::runtime_error("error: could not set expiry");
+            return fallback_->Allow(key);
         }
         freeReplyObject(expireReply);
     }

@@ -70,7 +70,7 @@ Result SlidingWindowLimiter::Allow(const std::string& key) {
                      (long long)window_.count()));
     if (reply == nullptr || reply->type != REDIS_REPLY_ARRAY || reply->elements != 2) {
         if (reply) freeReplyObject(reply);
-        throw std::runtime_error("error: sliding window script failed");
+        return fallback_->Allow(key);
     }
 
     long long allowed = reply->element[0]->integer;

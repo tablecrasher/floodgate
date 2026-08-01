@@ -54,7 +54,7 @@ Result TokenBucketLimiter::Allow(const std::string& key) {
         refill_rate_, now));
     if (reply == nullptr || reply->type != REDIS_REPLY_ARRAY || reply->elements != 2) {
         if (reply) freeReplyObject(reply);
-        throw std::runtime_error("error: token bucket script failed");
+        return fallback_->Allow(key);
     }
 
     long long allowed = reply->element[0]->integer;
