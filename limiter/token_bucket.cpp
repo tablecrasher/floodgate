@@ -4,52 +4,68 @@
 
 namespace limiter {
 
+namespace {
+
+// tokenBucketScript is defined once to avoid recompiling the script on every request.
+const char* kTokenBucketScript = R"(
+	local keys = KEYS[1]
+	local capacity = tonumber(ARGV[1])
+	local refill_rate = tonumber(ARGV[2])
+	local now = tonumber(ARGV[3])
+
+	local result = redis.call("HMGET", keys, "tokens", "lastRefill")
+	local tokens = result[1] -- Lua arrays start at 1, not 0
+	local lastRefill = result[2]
+
+	if tokens == false then
+		tokens = capacity
+	end
+	if lastRefill == false then
+		lastRefill = now
+	end
+
+	local elapsedTime = now - lastRefill
+	local tokensToAdd = elapsedTime * refill_rate
+
+	tokens = math.min(capacity, tokens+tokensToAdd)
+
+	local allowed = 0
+	if tokens >= 1 then
+		tokens = tokens - 1
+		allowed = 1
+	else
+		allowed = 0
+	end
+
+	local remaining = tokens
+	redis.call("HSET", keys, "tokens", tokens, "lastRefill", now)
+	redis.call("EXPIRE", keys, 3600)
+
+	return {allowed, remaining}
+)";
+
+}  // namespace
+
 Result TokenBucketLimiter::Allow(const std::string& key) {
-    // HGETALL returns all fields and values of the hash stored at key.
-    redisReply* reply =
-        static_cast<redisReply*>(redisCommand(client_, "HGETALL %s", key.c_str()));
-    if (reply == nullptr || reply->type != REDIS_REPLY_ARRAY) {
+    long long now = static_cast<long long>(time(nullptr));
+
+    redisReply* reply = static_cast<redisReply*>(redisCommand(
+        client_, "EVAL %s 1 %s %d %f %lld", kTokenBucketScript, key.c_str(), capacity_,
+        refill_rate_, now));
+    if (reply == nullptr || reply->type != REDIS_REPLY_ARRAY || reply->elements != 2) {
         if (reply) freeReplyObject(reply);
-        throw std::runtime_error("error: HGETALL command not working");
+        throw std::runtime_error("error: token bucket script failed");
     }
 
-    // Default to a full bucket if this key has never been seen
-    double tokens = static_cast<double>(capacity_);
-    double lastRefill = static_cast<double>(time(nullptr));
-
-    // reply->element alternates field, value, field, value, ...
-    for (size_t i = 0; i + 1 < reply->elements; i += 2) {
-        std::string field = reply->element[i]->str;
-        std::string value = reply->element[i + 1]->str;
-        if (field == "tokens") {
-            tokens = std::stod(value);
-        } else if (field == "lastRefill") {
-            lastRefill = std::stod(value);
-        }
-    }
+    long long allowed = reply->element[0]->integer;
+    long long remaining = reply->element[1]->integer;
     freeReplyObject(reply);
 
-    double timeNow = static_cast<double>(time(nullptr));
-    double elapsedTime = timeNow - lastRefill;
-    double tokensToAdd = elapsedTime * refill_rate_;
-    tokens = std::min(static_cast<double>(capacity_), tokens + tokensToAdd);
-
-    bool allowed = tokens >= 1;
-    if (allowed) {
-        tokens--;
-    }
-
-    redisReply* setReply = static_cast<redisReply*>(redisCommand(
-        client_, "HSET %s tokens %f lastRefill %f", key.c_str(), tokens, lastRefill));
-    if (setReply == nullptr) {
-        throw std::runtime_error("error: HSET command not working");
-    }
-    freeReplyObject(setReply);
-
-    if (allowed) {
-        return Result{true, static_cast<int>(tokens), std::chrono::system_clock::time_point{}};
-    }
-    return Result{false, 0, std::chrono::system_clock::time_point{}};
+    return Result{
+        allowed == 1,
+        static_cast<int>(remaining),
+        std::chrono::system_clock::time_point{},
+    };
 }
 
 }  // namespace limiter
